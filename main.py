@@ -35,8 +35,12 @@ for provider in provider_configs:
     key_pools[name] = itertools.cycle(keys)
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG,  # Change to DEBUG level
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("aiproxy.log")
+    ]
 )
 
 def get_provider_from_model(model: str) -> str:
@@ -100,9 +104,11 @@ async def proxy_chat(request: Request):
         logging.info(f"[REQUEST] Model: {model}, Provider: {provider}, Key: {key[:6]}***")
 
         if provider == "gemini":
-            return await call_gemini_openai_compatible(body, key, rate_limiter)
+            stream = body.get("stream", False)
+            return await call_gemini_openai_compatible(body, key, rate_limiter, stream=stream)
         else:
-            return await call_openrouter_openai_compatible(body, key, rate_limiter)
+            stream = body.get("stream", False)
+            return await call_openrouter_openai_compatible(body, key, rate_limiter, stream=stream)
 
     except KeyError:
         return JSONResponse(
