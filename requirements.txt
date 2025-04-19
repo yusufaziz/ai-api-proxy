@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+twisted
+openai
+google-genai
+pytest
+pytest-asyncio
+anyio
+pytest-tornasync
+pytest-trio
+pytest-twisted
