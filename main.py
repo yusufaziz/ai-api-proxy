@@ -3,13 +3,15 @@ from fastapi.responses import JSONResponse
 import httpx
 import json
 import itertools
-import time
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from collections import defaultdict
-from openai import OpenAI
+
+from rate_limiter import RateLimiter
+from providers import call_openrouter_openai_compatible, call_gemini_openai_compatible
 
 app = FastAPI()
+rate_limiter = RateLimiter()
 
 with open("config.json") as f:
     config = json.load(f)
@@ -20,9 +22,6 @@ access_key = config.get("access_key", "")
 model_usage_gap_percentage = config.get("model_usage_gap_percentage", 5)
 
 key_pools = defaultdict(itertools.cycle)
-request_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-token_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-rate_limit_windows: Dict[str, List[float]] = defaultdict(list)
 rate_limit_settings: Dict[str, Dict[str, int]] = {}
 
 for provider in provider_configs:
@@ -40,45 +39,16 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-def is_rate_limited(provider: str, key: str) -> bool:
-    now = time.time()
-    window_min = 60
-    settings = rate_limit_settings[provider]
-
-    # Per-minute request limit
-    req_min_window = [t for t in rate_limit_windows[f"req_min:{provider}:{key}"] if t > now - window_min]
-    if len(req_min_window) >= settings["max_request_min"]:
-        return True
-    rate_limit_windows[f"req_min:{provider}:{key}"] = req_min_window + [now]
-
-    # Placeholder for token logic (can be enhanced if tokens are known)
-    # Per-minute token limit not applied here directly due to lack of token count
-
-    # Per-day request limit
-    req_day_window = [t for t in rate_limit_windows[f"req_day:{provider}:{key}"] if t > now - 86400]
-    if len(req_day_window) >= settings["max_request_day"]:
-        return True
-    rate_limit_windows[f"req_day:{provider}:{key}"] = req_day_window + [now]
-
-    request_counts[provider][key] += 1
-    return False
-
 def get_provider_from_model(model: str) -> str:
     if model.startswith("gemini"):
         return "gemini"
     return "openrouter"
 
-def usage_gap_exceeded(provider: str) -> bool:
-    usage = request_counts[provider]
-    values = list(usage.values())
-    if len(values) < 2:
-        return False
-    max_val = max(values)
-    min_val = min(values)
-    if max_val == 0:
-        return False
-    gap_percent = ((max_val - min_val) / max_val) * 100
-    return gap_percent > model_usage_gap_percentage
+def get_min_usage_key(provider: str) -> Optional[str]:
+    usage = rate_limiter.request_counts[provider]
+    if not usage:
+        return None
+    return min(usage.items(), key=lambda x: x[1])[0]
 
 @app.post("/v1/chat/completions")
 async def proxy_chat(request: Request):
@@ -99,66 +69,62 @@ async def proxy_chat(request: Request):
             return JSONResponse(status_code=429, content={"error": "All models have reached their usage limits."})
         body["model"] = model
 
+    # Ensure tools are properly passed if present
+    if "tools" in body and not body["tools"]:
+        del body["tools"]  # Remove empty tools array
+
     provider = get_provider_from_model(model)
+    all_keys_tried = set()
 
     try:
-        for _ in range(len(provider_configs)):
-            key = next(key_pools[provider])
-            if not is_rate_limited(provider, key):
-                if not usage_gap_exceeded(provider):
-                    break
+        # First try the least used key
+        min_usage_key = get_min_usage_key(provider)
+        if min_usage_key and not rate_limiter.is_rate_limited(provider, min_usage_key, rate_limit_settings[provider]):
+            key = min_usage_key
         else:
-            return JSONResponse(status_code=429, content={"error": f"No usable key for provider '{provider}' within usage gap limit."})
+            # Try other available keys
+            while len(all_keys_tried) < len(list(key_pools[provider])):
+                key = next(key_pools[provider])
+                if key in all_keys_tried:
+                    continue
+                    
+                all_keys_tried.add(key)
+                if not rate_limiter.is_rate_limited(provider, key, rate_limit_settings[provider]):
+                    break
+            else:
+                return JSONResponse(
+                    status_code=429, 
+                    content={"error": f"All keys for provider '{provider}' have reached rate limits."}
+                )
+
+        logging.info(f"[REQUEST] Model: {model}, Provider: {provider}, Key: {key[:6]}***")
+
+        if provider == "gemini":
+            return await call_gemini_openai_compatible(body, key, rate_limiter)
+        else:
+            return await call_openrouter_openai_compatible(body, key, rate_limiter)
+
     except KeyError:
-        return JSONResponse(status_code=500, content={"error": f"No keys available for provider '{provider}'"})
-
-    logging.info(f"[REQUEST] Model: {model}, Provider: {provider}, Key: {key[:6]}***")
-
-    if provider == "gemini":
-        return await call_gemini_openai_compatible(body, key)
-    else:
-        return await call_openrouter_openai_compatible(body, key)
+        return JSONResponse(
+            status_code=500, 
+            content={"error": f"No keys available for provider '{provider}'"}
+        )
 
 async def select_next_available_model() -> Optional[str]:
     for model in auto_models:
         provider = get_provider_from_model(model)
         for entry in provider_configs:
             if entry["provider"] == provider:
+                # Try to get the least used key first
+                min_usage_key = get_min_usage_key(provider)
+                if min_usage_key and not rate_limiter.is_rate_limited(provider, min_usage_key, rate_limit_settings[provider]):
+                    return model
+                
+                # If no min usage key available, try any non-rate-limited key
                 for k in entry["key"]:
-                    if not is_rate_limited(provider, k):
-                        if not usage_gap_exceeded(provider):
-                            return model
+                    if not rate_limiter.is_rate_limited(provider, k, rate_limit_settings[provider]):
+                        return model
     return None
-
-async def call_openrouter_openai_compatible(payload: dict, key: str):
-    client = OpenAI(
-        api_key=key,
-        base_url="https://openrouter.ai/api/v1"
-    )
-    try:
-        response = client.chat.completions.create(
-            model=payload["model"],
-            messages=payload["messages"]
-        )
-        return JSONResponse(status_code=200, content=response.model_dump())
-    except Exception as e:
-        logging.error(f"OpenRouter error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Failed to complete OpenRouter request."})
-
-async def call_gemini_openai_compatible(payload: dict, key: str):
-    client = OpenAI(
-        api_key=key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-    )
-    try:
-        response = client.chat.completions.create(
-            model=payload["model"],
-            messages=payload["messages"]
-        )
-        return JSONResponse(status_code=200, content=response.model_dump())
-    except Exception as e:
-        logging.error(f"Gemini error: {e}")
-        return JSONResponse(status_code=500, content={"error": "Failed to complete Gemini request."})
 
 @app.get("/v1/models")
 async def list_models():
@@ -199,18 +165,4 @@ async def list_models():
 
 @app.get("/v1/usage")
 async def usage():
-    usage_data = {}
-    for provider, keys in request_counts.items():
-        usage_data[provider] = {
-            "keys": {},
-            "rate_limits": rate_limit_settings.get(provider, {})
-        }
-        for key, count in keys.items():
-            usage_data[provider]["keys"][key] = {
-                "requests": count,
-                "rate_limit_windows": {
-                    "req_min": len(rate_limit_windows.get(f"req_min:{provider}:{key}", [])),
-                    "req_day": len(rate_limit_windows.get(f"req_day:{provider}:{key}", []))
-                }
-            }
-    return JSONResponse(status_code=200, content=usage_data)
+    return JSONResponse(status_code=200, content=rate_limiter.get_usage_data(rate_limit_settings))
